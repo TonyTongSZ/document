@@ -1,0 +1,238 @@
+<#
+.SYNOPSIS
+  一键修复 Windows 365 应用安装错误 0x800705AA（资源不足/别名注册失败等）。
+
+.DESCRIPTION
+  - 自动提权、记录日志
+  - 资源/环境检查：磁盘、内存、PATH（WindowsApps）
+  - 清理 TEMP，重置 Store 缓存（wsreset）
+  - 修复系统映像与文件（DISM / SFC）
+  - 确认相关服务（AppXSVC、ClipSVC）
+  - 清理 Windows 365 残留包（含预配包）
+  - 使用 winget 从商店重新安装 Windows 365
+  - 导出 AppX 相关事件日志
+
+.NOTES
+  作者：M365 Copilot
+  运行需管理员权限；建议在执行前保存手头工作。
+#>
+
+#region 提权与日志
+# 如果不是管理员，自动以管理员重启自身
+$curr = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($curr)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)) {
+    Write-Host "正在请求管理员权限运行脚本..." -ForegroundColor Yellow
+    $arg = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    Start-Process -FilePath "powershell.exe" -ArgumentList $arg -Verb RunAs
+    exit
+}
+
+# 日志目录和文件
+$stamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
+$LogRoot = Join-Path $env:USERPROFILE "Desktop\Win365_Fix_$stamp"
+New-Item -Path $LogRoot -ItemType Directory -Force | Out-Null
+$LogFile = Join-Path $LogRoot "Fix.log"
+
+Start-Transcript -Path $LogFile -Append | Out-Null
+Write-Host "日志路径：$LogFile" -ForegroundColor Cyan
+#endregion
+
+function Write-Section($title) {
+    Write-Host "`n==== $title ====" -ForegroundColor Green
+}
+
+try {
+    Write-Section "环境与资源检查"
+
+    # 系统信息
+    $os = Get-CimInstance Win32_OperatingSystem
+    $ComputerName = $env:COMPUTERNAME
+    $OSCaption = $os.Caption
+    $OSVersion = $os.Version
+    Write-Host "计算机：$ComputerName" -ForegroundColor Gray
+    Write-Host "系统版本：$OSCaption ($OSVersion)" -ForegroundColor Gray
+
+    # 磁盘空间（C:）
+    $minGB = 10
+    $cdrive = Get-PSDrive -Name C -ErrorAction SilentlyContinue
+    if ($cdrive) {
+        $freeGB = [math]::Round($cdrive.Free/1GB,2)
+        $totalGB = [math]::Round($cdrive.Used/1GB + $freeGB,2)
+        Write-Host ("C: 盘剩余空间：{0} GB / 总计 {1} GB" -f $freeGB, $totalGB)
+        if ($freeGB -lt $minGB) {
+            Write-Warning "C: 盘剩余空间低于 ${minGB}GB，建议释放空间（目标≥15GB）。脚本将尝试清理 TEMP。"
+        }
+    } else {
+        Write-Warning "未能获取 C: 盘信息。"
+    }
+
+    # 内存状况
+    if ($os.TotalVisibleMemorySize -gt 0) {
+        $totalMB = [math]::Round($os.TotalVisibleMemorySize/1024,0)
+        $freeMB  = [math]::Round($os.FreePhysicalMemory/1024,0)
+        $usedPct = [math]::Round((($totalMB - $freeMB)/$totalMB)*100,0)
+        Write-Host ("内存：{0} MB（已用 {1}%）" -f $totalMB, $usedPct)
+        if ($usedPct -gt 85) {
+            Write-Warning "内存占用较高，建议关闭占用大的程序（浏览器/IDE/VM），避免资源不足。"
+        }
+    }
+
+    # 确认 WindowsApps 在用户 PATH
+    $windowsApps = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
+    $userPath = [Environment]::GetEnvironmentVariable("Path","User")
+    if ($null -eq $userPath) { $userPath = "" }
+    if (-not (Test-Path $windowsApps)) {
+        Write-Warning "未发现路径：$windowsApps。此路径用于 App Execution Alias。"
+    } elseif ($userPath -notmatch [Regex]::Escape($windowsApps)) {
+        try {
+            [Environment]::SetEnvironmentVariable("Path", ($userPath.TrimEnd(';') + ";" + $windowsApps), "User")
+            Write-Host "已将 WindowsApps 添加至用户 PATH。请在后续如遇命令行找不到别名时注销/重启生效。" -ForegroundColor Yellow
+        } catch {
+            Write-Warning "添加 WindowsApps 到 PATH 失败：$($_.Exception.Message)"
+        }
+    } else {
+        Write-Host "WindowsApps 已在 PATH 中。"
+    }
+
+    Write-Section "释放资源：清理 TEMP 目录"
+    $tempPaths = @($env:TEMP, "$env:WINDIR\Temp")
+    foreach ($p in $tempPaths) {
+        if (Test-Path $p) {
+            Write-Host "清理：$p"
+            try {
+                Get-ChildItem $p -Force -ErrorAction SilentlyContinue | 
+                    Where-Object { -not $_.PsIsContainer } | 
+                    Remove-Item -Force -ErrorAction SilentlyContinue
+                Get-ChildItem $p -Directory -Force -ErrorAction SilentlyContinue | 
+                    ForEach-Object {
+                        try { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+                    }
+            } catch {
+                Write-Warning "清理 $p 遇到问题：$($_.Exception.Message)"
+            }
+        }
+    }
+
+    Write-Section "重置 Microsoft Store 缓存（wsreset）"
+    try {
+        Start-Process -FilePath "wsreset.exe" -Wait -WindowStyle Hidden
+        Start-Sleep -Seconds 3
+    } catch {
+        Write-Warning "wsreset 执行失败：$($_.Exception.Message)"
+    }
+
+    Write-Section "修复系统映像与文件（DISM / SFC）——可能耗时较长"
+    try {
+        Start-Process -FilePath "dism.exe" -ArgumentList "/Online","/Cleanup-Image","/RestoreHealth" -Wait -NoNewWindow
+    } catch {
+        Write-Warning "DISM 执行失败：$($_.Exception.Message)"
+    }
+    try {
+        Start-Process -FilePath "sfc.exe" -ArgumentList "/scannow" -Wait -NoNewWindow
+    } catch {
+        Write-Warning "SFC 执行失败：$($_.Exception.Message)"
+    }
+
+    Write-Section "检查并启动相关服务（AppXSVC / ClipSVC）"
+    $svcNames = @("AppXSVC","ClipSVC")
+    foreach ($sn in $svcNames) {
+        $svc = Get-Service -Name $sn -ErrorAction SilentlyContinue
+        if ($null -eq $svc) {
+            Write-Warning "未找到服务：$sn"
+            continue
+        }
+        # 如果处于停止/挂起，尝试启动
+        if ($svc.Status -ne 'Running') {
+            try {
+                if ($svc.StartType -eq 'Disabled') {
+                    Set-Service -Name $sn -StartupType Manual
+                }
+                Start-Service -Name $sn -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 2
+                $svc.Refresh()
+                Write-Host "$sn 状态：$($svc.Status)"
+            } catch {
+                Write-Warning "启动服务 $sn 失败：$($_.Exception.Message)"
+            }
+        } else {
+            Write-Host "$sn 已在运行。"
+        }
+    }
+
+    Write-Section "清理 Windows 365 残留（Appx 包 / 预配包）"
+    try {
+        $targetPattern = "*Windows365*"
+        $pkgList = Get-AppxPackage -AllUsers $targetPattern -ErrorAction SilentlyContinue
+        if ($pkgList) {
+            $pkgList | ForEach-Object {
+                Write-Host "移除用户包：$($_.PackageFullName)"
+                try {
+                    Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction Continue
+                } catch {
+                    Write-Warning "移除失败（可能已损坏或被占用）：$($_.Exception.Message)"
+                }
+            }
+        } else {
+            Write-Host "未发现用户级残留包。"
+        }
+
+        $provList = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like $targetPattern }
+        if ($provList) {
+            $provList | ForEach-Object {
+                Write-Host "移除预配包：$($_.DisplayName)"
+                try {
+                    Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName | Out-Null
+                } catch {
+                    Write-Warning "移除预配包失败：$($_.Exception.Message)"
+                }
+            }
+        } else {
+            Write-Host "未发现预配包残留。"
+        }
+    } catch {
+        Write-Warning "清理 Windows 365 残留时出错：$($_.Exception.Message)"
+    }
+
+    Write-Section "从 Microsoft Store 通过 winget 重新安装 Windows 365"
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if ($winget) {
+        try {
+            & winget source update --quiet | Out-Null
+        } catch { }
+        try {
+            # 强制接受协议，避免交互；如需交互登录商店，请在图形界面中先登录。
+            & winget install --id Microsoft.Windows365 --source msstore --accept-source-agreements --accept-package-agreements --force
+        } catch {
+            Write-Warning "winget 安装失败：$($_.Exception.Message)"
+        }
+    } else {
+        Write-Warning "未检测到 winget（App Installer）。请从 Microsoft Store 安装/更新“App Installer”，或改用商店图形界面安装 Windows 365。"
+    }
+
+    Write-Section "导出 AppX 部署相关事件日志（最近 4 小时）"
+    $since = (Get-Date).AddHours(-4)
+    $log1 = Join-Path $LogRoot "AppxDeployment-Server.log"
+    $log2 = Join-Path $LogRoot "AppxPackagingOM.log"
+
+    try {
+        Get-WinEvent -LogName "Microsoft-Windows-AppxDeployment-Server/Operational" -ErrorAction SilentlyContinue |
+            Where-Object { $_.TimeCreated -ge $since -and ($_.LevelDisplayName -eq 'Error' -or $_.LevelDisplayName -eq 'Warning') } |
+            Select-Object TimeCreated, Id, LevelDisplayName, Message |
+            Format-List | Out-File -FilePath $log1 -Encoding UTF8
+        Write-Host "已导出：$log1"
+    } catch {
+        Write-Warning "导出 AppxDeployment-Server 日志失败：$($_.Exception.Message)"
+    }
+    try {
+        Get-WinEvent -LogName "Microsoft-Windows-AppxPackagingOM/Operational" -ErrorAction SilentlyContinue |
+            Where-Object { $_.TimeCreated -ge $since -and ($_.LevelDisplayName -eq 'Error' -or $_.LevelDisplayName -eq 'Warning') } |
+            Select-Object TimeCreated, Id, LevelDisplayName, Message |
+            Format-List | Out-File -FilePath $log2 -Encoding UTF8
+        Write-Host "已导出：$log2"
+    } catch {
+        Write-Warning "导出 AppxPackagingOM 日志失败：$($_.Exception.Message)"
+    }
+
+    Write-Section "完成"
+    Write-Host "✅ 脚本执行结束。建议现在重启电脑后再尝试运行 Windows 365。"
